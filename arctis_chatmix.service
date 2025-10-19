@@ -1,0 +1,13 @@
+[Unit]
+Description=Arctis 7+ ChatMix (virtual-sink mixer)
+Wants=pipewire.service
+After=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/arctis_chatmix
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
