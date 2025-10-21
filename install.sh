@@ -138,6 +138,7 @@ After=pipewire.service
 [Service]
 Type=simple
 ExecStart=%h/.local/bin/arctis_chatmix
+Environment=ARCTIS_SIDETONE_DISABLE=1
 Restart=on-failure
 RestartSec=5
 
@@ -193,6 +194,7 @@ After=pipewire.service
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/arctis_chatmix
+Environment=ARCTIS_SIDETONE_DISABLE=1
 Restart=on-failure
 RestartSec=5
 
@@ -213,6 +215,7 @@ After=pipewire.service
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/arctis_chatmix
+Environment=ARCTIS_SIDETONE_DISABLE=1
 Restart=on-failure
 RestartSec=5
 

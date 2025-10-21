@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use ctrlc;
 use env_logger;
+use hidapi::HidApi;
 use log::{debug, error, info, warn};
 use rusb::{DeviceHandle, UsbContext};
 use std::process::{Command, Stdio};
@@ -9,9 +10,11 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
+use std::env;
 
 const VENDOR_ID: u16 = 0x1038;
 const PRODUCT_ID: u16 = 0x2202;
+const HID_MSG_SIZE: usize = 64;
 
 struct ArctisController {
     original_default_sink: String,
@@ -40,7 +43,6 @@ impl ArctisController {
     }
 
     fn setup_virtual_sinks(&self) -> Result<()> {
-        // Only create sinks once
         if self.sinks_created.load(Ordering::SeqCst) {
             info!("Virtual sinks already exist, skipping creation");
             return Ok(());
@@ -109,7 +111,6 @@ impl ArctisController {
     }
 
     fn start(&self) -> Result<()> {
-        // Initial setup - ensure sinks exist (retries until audio sink is visible)
         loop {
             if !self.running.load(Ordering::SeqCst) {
                 return Ok(());
@@ -125,7 +126,6 @@ impl ArctisController {
             }
         }
 
-        // Main reconnection loop
         loop {
             if !self.running.load(Ordering::SeqCst) {
                 break;
@@ -133,7 +133,6 @@ impl ArctisController {
 
             match self.try_connect_and_run() {
                 Ok(_) => {
-                    // try_connect_and_run returns Ok only on graceful shutdown (running=false)
                     info!("Connection loop ended gracefully; exiting main loop");
                     break;
                 }
@@ -145,7 +144,6 @@ impl ArctisController {
                     warn!("USB connection lost / error: {}", e);
                     info!("Device disconnected or became unresponsive. Waiting for reconnection...");
                     std::thread::sleep(Duration::from_secs(3));
-                    // loop and try to reconnect
                 }
             }
         }
@@ -200,7 +198,6 @@ impl ArctisController {
             }
         }
 
-        // If running == false, return Ok so shutdown proceeds normally.
         Ok(())
     }
 
@@ -224,7 +221,6 @@ impl ArctisController {
                     }
                 }
                 Err(rusb::Error::Timeout) => {
-                    // Normal, nothing to do
                     consecutive_errors = 0;
                     continue;
                 }
@@ -281,7 +277,6 @@ impl ArctisController {
                         info!("Linked Arctis_Chat -> {}", arctis_sink);
                     }
 
-                    // ensure default sink is set to Arctis_Game again (helps some clients)
                     let status = Command::new("pactl")
                         .args(&["set-default-sink", "Arctis_Game"])
                         .status();
@@ -292,7 +287,6 @@ impl ArctisController {
                         Err(e) => warn!("Failed to run pactl: {:?}", e),
                     }
 
-                    // allow PipeWire a moment to rewire streams
                     std::thread::sleep(Duration::from_millis(300));
                     return Ok(());
                 }
@@ -370,8 +364,6 @@ fn find_arctis_sink() -> Result<String> {
 
     let sinks = String::from_utf8(output.stdout)?;
 
-    // Prefer the USB/USB-audio sink if present; fall back to any "arctis" + "7"
-    // We'll try to pick a sink that looks like a USB device (often contains "usb" or "playback" or "dot")
     let mut fallback: Option<String> = None;
     for line in sinks.lines() {
         let lower = line.to_lowercase();
@@ -379,11 +371,9 @@ fn find_arctis_sink() -> Result<String> {
             let parts: Vec<&str> = line.split('\t').collect();
             if parts.len() >= 2 {
                 let name = parts[1].to_string();
-                // heuristics for preferring a USB device name
                 if lower.contains("usb") || lower.contains("playback") || lower.contains("dot") || lower.contains("wireless") {
                     return Ok(name);
                 }
-                // keep as fallback
                 if fallback.is_none() {
                     fallback = Some(name);
                 }
@@ -398,9 +388,7 @@ fn find_arctis_sink() -> Result<String> {
     anyhow::bail!("No Arctis 7 device found in pactl output");
 }
 
-// try to link a sink monitor to a device playback ports
 fn link_sink_to_device(sink_name: &str, device_name: &str) -> Result<()> {
-    // try to connect FL and FR channels; pw-link expects exact port names like "node:monitor_FL"
     let fl_link = Command::new("pw-link")
         .arg(format!("{}:monitor_FL", sink_name))
         .arg(format!("{}:playback_FL", device_name))
@@ -442,9 +430,7 @@ fn set_sink_volume(sink_name: &str, volume_percent: u8) {
     }
 }
 
-// Move all current sink-inputs (clients) to the named sink
 fn move_all_inputs_to(sink_name: &str) -> Result<()> {
-    // List sink-inputs as "index\t..."
     let output = Command::new("pactl")
         .args(&["list", "short", "sink-inputs"])
         .output()
@@ -470,6 +456,84 @@ fn move_all_inputs_to(sink_name: &str) -> Result<()> {
 
     Ok(())
 }
+
+/* ---------- hidapi sidetone write (uses the real HidApi::open + write) ---------- */
+
+/// Try to send sidetone report via hidapi if environment requests it.
+/// This uses HidApi::open() and device.write() and mirrors your provided snippet.
+/// Non-fatal: errors are logged but do not stop device claim.
+fn try_hidapi_sidetone_from_env() {
+    // Determine desired percent or disable flag
+    if let Ok(v) = env::var("ARCTIS_SIDETONE_DISABLE") {
+        if matches!(v.as_str(), "1" | "yes" | "true" | "on") {
+            if let Err(e) = hidapi_send_sidetone(0) {
+                warn!("hidapi sidetone write failed: {}", e);
+            }
+            return;
+        }
+        else {
+            if let Err(e) = hidapi_send_sidetone(100) {
+                warn!("hidapi sidetone write failed: {}", e);
+            }
+            return;
+        }
+    }
+
+    if let Ok(v) = env::var("ARCTIS_SIDETONE_PERCENT") {
+        if let Ok(mut num) = v.trim().parse::<u8>() {
+            if num > 100 {
+                num = 100;
+            }
+            if let Err(e) = hidapi_send_sidetone(num) {
+                warn!("hidapi sidetone write failed: {}", e);
+            }
+        } else {
+            debug!("ARCTIS_SIDETONE_PERCENT invalid: '{}'", v);
+        }
+    }
+}
+
+/// Build 64-byte buffer and write using HidApi
+fn hidapi_send_sidetone(percent: u8) -> Result<()> {
+    // bucket mapping per your snippet: <30->0, <60->1, <80->2, else 3
+    let bucket = if percent < 30 {
+        0x00u8
+    } else if percent < 60 {
+        0x01u8
+    } else if percent < 80 {
+        0x02u8
+    } else {
+        0x03u8
+    };
+
+    let mut data = [0u8; HID_MSG_SIZE];
+    data[0] = 0x00;
+    data[1] = 0x39;
+    data[2] = bucket;
+
+    match HidApi::new() {
+        Ok(api) => match api.open(VENDOR_ID, PRODUCT_ID) {
+            Ok(device) => match device.write(&data) {
+                Ok(n) => {
+                    info!("hidapi: wrote {} bytes for sidetone (bucket {})", n, bucket);
+                }
+                Err(e) => {
+                    anyhow::bail!("hidapi write error: {}", e);
+                }
+            },
+            Err(e) => {
+                anyhow::bail!("hidapi open error: {}", e);
+            }
+        },
+        Err(e) => {
+            anyhow::bail!("hidapi init error: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
+/* ---------- end hidapi sidetone ---------- */
 
 // Return (handle, endpoint_addr, interface_number)
 // This version tries to enable libusb auto-detach, falls back to manual detach,
@@ -517,10 +581,14 @@ fn usb_find_and_open<T: UsbContext>(usb_ctx: &T) -> Result<(DeviceHandle<T>, u8,
     let interface_num = target_interface_num
         .ok_or_else(|| anyhow::anyhow!("Could not find HID interface"))?;
 
+    // Open the device with rusb (we will still use hidapi for the write above)
     let mut handle = dev.open().context("Failed to open USB device")?;
 
+    // Attempt an hidapi sidetone write before claiming the interface.
+    // (your working HidApi approach opens the device via hidraw and writes 64 bytes)
+    try_hidapi_sidetone_from_env();
+
     // Try to enable libusb automatic kernel-driver detaching (if available).
-    // If it's not supported, fall back to manual detach below.
     match handle.set_auto_detach_kernel_driver(true) {
         Ok(_) => info!("Enabled auto-detach kernel driver on handle"),
         Err(e) => {
@@ -528,10 +596,8 @@ fn usb_find_and_open<T: UsbContext>(usb_ctx: &T) -> Result<(DeviceHandle<T>, u8,
         }
     }
 
-    // Try to claim interface, retrying a few times while detaching kernel driver if needed.
     const CLAIM_RETRIES: usize = 6;
     for attempt in 1..=CLAIM_RETRIES {
-        // If kernel driver is active, attempt to detach it manually.
         match handle.kernel_driver_active(interface_num) {
             Ok(true) => {
                 match handle.detach_kernel_driver(interface_num) {
@@ -542,13 +608,12 @@ fn usb_find_and_open<T: UsbContext>(usb_ctx: &T) -> Result<(DeviceHandle<T>, u8,
                     ),
                 }
             }
-            Ok(false) => { /* nothing to do */ }
+            Ok(false) => { }
             Err(e) => {
                 debug!("kernel_driver_active check failed: {:?}", e);
             }
         }
 
-        // Try to claim
         match handle.claim_interface(interface_num) {
             Ok(_) => {
                 info!("Successfully claimed interface {}", interface_num);
@@ -559,7 +624,6 @@ fn usb_find_and_open<T: UsbContext>(usb_ctx: &T) -> Result<(DeviceHandle<T>, u8,
                     "claim_interface failed on attempt {}/{}: {:?}",
                     attempt, CLAIM_RETRIES, e
                 );
-                // On the final attempt, return the error
                 if attempt == CLAIM_RETRIES {
                     return Err(anyhow::anyhow!(
                         "Failed to claim interface {} after {} attempts: {:?}",
@@ -568,14 +632,11 @@ fn usb_find_and_open<T: UsbContext>(usb_ctx: &T) -> Result<(DeviceHandle<T>, u8,
                         e
                     ));
                 }
-                // Small backoff before retrying so kernel has time to release/reattach
                 std::thread::sleep(Duration::from_millis(200 * attempt as u64));
                 continue;
             }
         }
     }
 
-    // Shouldn't be reachable
     Err(anyhow::anyhow!("Failed to open and claim device"))
 }
-
